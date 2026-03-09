@@ -158,17 +158,21 @@ async function findSlugByTitles(titles, type) {
   for (const title of titles) {
     const cacheKey = `pifan:slug:${type}:${title}`;
     const cached = getCache(cacheKey);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined && cached !== null) return cached;
     try {
-      console.log(`[PIFAN] Buscando: "${title}"`);
-      const html = await fetchPage(`${BASE}/?s=${encodeURIComponent(title)}`);
+      console.log(`[PIFAN] Buscando: "${title}" type=${type}`);
+      // Não usa fetchPage (que cacheia) para ter resultado fresco
+      const { data: html } = await axios.get(`${BASE}/?s=${encodeURIComponent(title)}`, {
+        headers, timeout: 15000,
+      });
       const items = parseArticles(html, type);
+      console.log(`[PIFAN] Resultados: ${items.map(i => i.slug).join(", ") || "nenhum"}`);
       if (items.length > 0) {
-        console.log(`[PIFAN] Encontrado: ${items[0].slug}`);
+        console.log(`[PIFAN] OK: ${items[0].slug}`);
         setCache(cacheKey, items[0].slug, 24 * 60 * 60 * 1000);
         return items[0].slug;
       }
-      setCache(cacheKey, null, 60 * 60 * 1000);
+      setCache(cacheKey, null, 30 * 60 * 1000);
     } catch (e) {
       console.warn(`[PIFAN] Erro "${title}": ${e.message}`);
     }
@@ -374,6 +378,27 @@ async function fetchStream(episodeSlug) {
   throw new Error(`Stream nao encontrado: ${episodeSlug}`);
 }
 
+// Gera variações de título para aumentar chance de match no PiFansubs
+function titleVariants(titles) {
+  const variants = new Set();
+  for (const t of titles) {
+    if (!t) continue;
+    // Ignora títulos em alfabetos não-latinos (tailandês, coreano, japonês, chinês)
+    if (/[฀-๿가-힯぀-ヿ一-鿿]/.test(t)) continue;
+    variants.add(t);
+    // Remove subtítulo após ":" ou "—" (ex: "Color Rush: The Tint" → "Color Rush")
+    variants.add(t.split(/\s*[:—–]\s*/)[0].trim());
+    // Remove artigos no início
+    variants.add(t.replace(/^(the|a|an)\s+/i, "").trim());
+    // Remove "Season X" no final
+    variants.add(t.replace(/\s*season\s*\d+$/i, "").trim());
+    // Primeiras 3 palavras para títulos longos
+    const words = t.split(" ");
+    if (words.length > 3) variants.add(words.slice(0, 3).join(" "));
+  }
+  return [...variants].filter(v => v.length > 1);
+}
+
 // Resolve o slug do episódio a partir de qualquer formato de ID
 async function resolveEpisodeSlug(id, type) {
   console.log(`[RESOLVE] id=${id} type=${type}`);
@@ -397,8 +422,10 @@ async function resolveEpisodeSlug(id, type) {
       return null;
     }
 
-    // 2. Busca slug no PiFansubs
-    const slug = await findSlugByTitles(titles, type);
+    // 2. Busca slug no PiFansubs com variações de título
+    const variants = titleVariants(titles);
+    console.log(`[RESOLVE] Variações: ${variants.join(" | ")}`);
+    const slug = await findSlugByTitles(variants, type);
     if (!slug) {
       console.log(`[RESOLVE] PiFansubs nao tem: ${titles.join(" / ")}`);
       return null;
