@@ -515,20 +515,19 @@ builder.defineStreamHandler(async ({ type, id }) => {
   }
 });
 
-// ─── Servidor HTTP com proxy HLS embutido ────────────────────────────────────
-const http = require("http");
-const url_mod = require("url");
+// ─── Servidor com proxy HLS + SDK via getRouter ──────────────────────────────
+const express = require("express");
+const { getRouter } = require("stremio-addon-sdk");
 
-// O SDK cria seu próprio servidor interno — interceptamos antes
-const sdkInterface = builder.getInterface();
+const app = express();
 
-async function handleProxy(req, res) {
-  const parsed = url_mod.parse(req.url, true);
-  const targetUrl = decodeURIComponent(parsed.query.url || "");
-  const referer   = decodeURIComponent(parsed.query.ref || BASE);
+// Proxy HLS: baixa .m3u8 ou segmento e repassa com headers corretos
+app.get("/hlsproxy", async (req, res) => {
+  const targetUrl = decodeURIComponent(req.query.url || "");
+  const referer   = decodeURIComponent(req.query.ref || BASE);
 
   if (!targetUrl.startsWith("http")) {
-    res.writeHead(400); res.end("URL inválida"); return;
+    return res.status(400).send("URL inválida");
   }
 
   try {
@@ -552,28 +551,25 @@ async function handleProxy(req, res) {
         const abs = trimmed.startsWith("http") ? trimmed : baseUrl + trimmed;
         return makeProxyUrl(abs, referer);
       }).join("\n");
-      res.writeHead(200, { "Content-Type": "application/vnd.apple.mpegurl", "Access-Control-Allow-Origin": "*" });
-      res.end(rewritten);
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.send(rewritten);
     } else {
-      res.writeHead(200, { "Content-Type": response.headers["content-type"] || "video/mp2t", "Access-Control-Allow-Origin": "*" });
+      res.setHeader("Content-Type", response.headers["content-type"] || "video/mp2t");
+      res.setHeader("Access-Control-Allow-Origin", "*");
       response.data.pipe(res);
     }
   } catch (e) {
     console.error(`[PROXY] Erro: ${e.message}`);
-    res.writeHead(502); res.end("Proxy error");
+    res.status(502).send("Proxy error");
   }
-}
-
-// Servidor HTTP que roteia /hlsproxy para o proxy e o resto para o SDK
-const server = http.createServer((req, res) => {
-  if (req.url && req.url.startsWith("/hlsproxy")) {
-    return handleProxy(req, res);
-  }
-  // Usa o handler interno do SDK (é uma função request/response padrão Node)
-  sdkInterface.router(req, res);
 });
 
-server.listen(PORT, () => {
+// Addon Stremio via getRouter (Express router oficial do SDK)
+const addonRouter = getRouter(builder.getInterface());
+app.use("/", addonRouter);
+
+app.listen(PORT, () => {
   console.log(`\n✅ PiFansubs addon rodando em http://localhost:${PORT}`);
   console.log(`📺 Instale no Stremio: http://localhost:${PORT}/manifest.json`);
   console.log(`🔗 ADDON_URL=${ADDON_URL}\n`);
