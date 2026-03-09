@@ -133,22 +133,23 @@ async function tmdbSearch(query, type) {
 async function getTitlesFromImdb(imdbId, type) {
   const cacheKey = `imdb:titles:${imdbId}`;
   const cached = getCache(cacheKey);
-  if (cached !== undefined) return cached;
+  // Nunca usa cache null — sempre tenta a API de novo
+  if (cached !== undefined && cached !== null) return cached;
   try {
     const tmdbType = type === "movie" ? "movie" : "tv";
     const { data } = await axios.get(`https://api.themoviedb.org/3/find/${imdbId}`, {
       params: { api_key: TMDB_KEY, external_source: "imdb_id" },
       timeout: 8000,
     });
+    console.log(`[TMDB] find/${imdbId} tv=${data.tv_results?.length} movie=${data.movie_results?.length}`);
     const r = (data[`${tmdbType}_results`] || [])[0];
-    if (!r) { setCache(cacheKey, null, 60 * 60 * 1000); return null; }
+    if (!r) { return null; }
     const titles = [r.name || r.title, r.original_name || r.original_title].filter(Boolean);
     console.log(`[TMDB] ${imdbId} -> ${titles.join(" / ")}`);
     setCache(cacheKey, titles, 7 * 24 * 60 * 60 * 1000);
     return titles;
   } catch (e) {
     console.warn(`[TMDB] Erro ${imdbId}: ${e.message}`);
-    setCache(cacheKey, null, 60 * 60 * 1000);
     return null;
   }
 }
