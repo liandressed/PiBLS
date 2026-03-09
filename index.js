@@ -515,33 +515,31 @@ builder.defineStreamHandler(async ({ type, id }) => {
   }
 });
 
-// ─── Servidor Express com rota de proxy HLS ───────────────────────────────────
-const express = require("express");
-const app = express();
+// ─── Servidor HTTP com proxy HLS embutido ────────────────────────────────────
+const http = require("http");
+const url_mod = require("url");
 
-// Proxy HLS: baixa .m3u8 ou segmento e repassa com headers corretos
-app.get("/hlsproxy", async (req, res) => {
-  const targetUrl = decodeURIComponent(req.query.url || "");
-  const referer   = decodeURIComponent(req.query.ref || BASE);
+// O SDK cria seu próprio servidor interno — interceptamos antes
+const sdkInterface = builder.getInterface();
+
+async function handleProxy(req, res) {
+  const parsed = url_mod.parse(req.url, true);
+  const targetUrl = decodeURIComponent(parsed.query.url || "");
+  const referer   = decodeURIComponent(parsed.query.ref || BASE);
 
   if (!targetUrl.startsWith("http")) {
-    return res.status(400).send("URL inválida");
+    res.writeHead(400); res.end("URL inválida"); return;
   }
 
   try {
     const isM3u8 = targetUrl.includes(".m3u8") || targetUrl.includes("playlist");
     const response = await axios.get(targetUrl, {
-      headers: {
-        ...headers,
-        "Referer": referer,
-        "Origin": new URL(referer).origin,
-      },
+      headers: { ...headers, "Referer": referer, "Origin": new URL(referer).origin },
       responseType: isM3u8 ? "text" : "stream",
       timeout: 15000,
     });
 
     if (isM3u8) {
-      // Reescreve URLs dentro do m3u8 para também passar pelo proxy
       const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
       const rewritten = response.data.split("\n").map(line => {
         const trimmed = line.trim();
@@ -554,29 +552,28 @@ app.get("/hlsproxy", async (req, res) => {
         const abs = trimmed.startsWith("http") ? trimmed : baseUrl + trimmed;
         return makeProxyUrl(abs, referer);
       }).join("\n");
-
-      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.send(rewritten);
+      res.writeHead(200, { "Content-Type": "application/vnd.apple.mpegurl", "Access-Control-Allow-Origin": "*" });
+      res.end(rewritten);
     } else {
-      // Segmento: repassa o stream binário
-      res.setHeader("Content-Type", response.headers["content-type"] || "video/mp2t");
-      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.writeHead(200, { "Content-Type": response.headers["content-type"] || "video/mp2t", "Access-Control-Allow-Origin": "*" });
       response.data.pipe(res);
     }
   } catch (e) {
-    console.error(`[PROXY] Erro: ${e.message} url=${targetUrl.slice(0, 80)}`);
-    res.status(502).send("Proxy error");
+    console.error(`[PROXY] Erro: ${e.message}`);
+    res.writeHead(502); res.end("Proxy error");
   }
+}
+
+// Servidor HTTP que roteia /hlsproxy para o proxy e o resto para o SDK
+const server = http.createServer((req, res) => {
+  if (req.url && req.url.startsWith("/hlsproxy")) {
+    return handleProxy(req, res);
+  }
+  // Usa o handler interno do SDK (é uma função request/response padrão Node)
+  sdkInterface.router(req, res);
 });
 
-// Monta o addon Stremio no mesmo servidor Express
-// getInterface() retorna { manifest, query } — usamos o router do SDK
-const { getRouter } = require("stremio-addon-sdk");
-const addonRouter = getRouter(builder.getInterface());
-app.use("/", addonRouter);
-
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`\n✅ PiFansubs addon rodando em http://localhost:${PORT}`);
   console.log(`📺 Instale no Stremio: http://localhost:${PORT}/manifest.json`);
   console.log(`🔗 ADDON_URL=${ADDON_URL}\n`);
