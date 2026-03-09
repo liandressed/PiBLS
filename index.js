@@ -321,12 +321,14 @@ async function fetchCineBLStream(embedId, episodeUrl) {
 }
 
 // ─── Stream ───────────────────────────────────────────────────────────────────
-async function fetchStream(episodeSlug) {
+async function fetchStream(episodeSlug, mediaType = "tv") {
   const cacheKey = `stream:${episodeSlug}`;
   const cached = getCache(cacheKey);
   if (cached) return cached;
 
-  const url = `${BASE}/episodios/${episodeSlug}/`;
+  // Filmes ficam em /filmes/, séries em /episodios/
+  const urlPath = mediaType === "movie" ? `${BASE}/filmes/${episodeSlug}/` : `${BASE}/episodios/${episodeSlug}/`;
+  const url = urlPath;
   const { data: html } = await axios.get(url, {
     headers: { ...headers, "Referer": BASE },
     timeout: 15000,
@@ -350,7 +352,7 @@ async function fetchStream(episodeSlug) {
     console.log(`[STREAM] AJAX: postId=${postId} nume=${nume}`);
     const { data } = await axios.post(
       `${BASE}/wp-admin/admin-ajax.php`,
-      new URLSearchParams({ action: "doo_player_ajax", post: postId, nume, type: "tv" }).toString(),
+      new URLSearchParams({ action: "doo_player_ajax", post: postId, nume, type: mediaType === "movie" ? "movie" : "tv" }).toString(),
       { headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", "Referer": url }, timeout: 15000 }
     );
     console.log(`[STREAM] embed_url: ${JSON.stringify(data).slice(0, 120)}`);
@@ -459,6 +461,26 @@ async function resolveEpisodeSlug(id, type) {
   // Formato próprio com episódio: pifansubs:slug:ep:epslug
   if (id.includes(":ep:")) {
     return id.split(":ep:")[1];
+  }
+
+  // Formato filme: tt1234567 simples (sem season:episode)
+  const ttMovieMatch = id.match(/^(tt\d+)$/) || (type === "movie" ? id.match(/^(tt\d+)/) : null);
+  if (ttMovieMatch && type === "movie") {
+    const imdbId = ttMovieMatch[1];
+    const titles = await getTitlesFromImdb(imdbId, "movie");
+    if (!titles) {
+      console.log(`[RESOLVE] TMDB nao encontrou filme ${imdbId}`);
+      return null;
+    }
+    const variants = titleVariants(titles);
+    console.log(`[RESOLVE] Filme variações: ${variants.join(" | ")}`);
+    const slug = await findSlugByTitles(variants, "movie");
+    if (!slug) {
+      console.log(`[RESOLVE] PiFansubs nao tem filme: ${titles.join(" / ")}`);
+      return null;
+    }
+    console.log(`[RESOLVE] ✅ Filme ${imdbId} -> ${slug}`);
+    return slug;
   }
 
   // Formato Cinemeta: tt1234567:season:episode
@@ -605,7 +627,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
       console.log(`[STREAM] Sem slug para ${id}`);
       return { streams: [] };
     }
-    const stream = await fetchStream(episodeSlug);
+    const stream = await fetchStream(episodeSlug, type);
 
     // Para M3U8: serve via proxy HLS do addon para evitar bloqueios de Referer
     let streamUrl = stream.url;
@@ -662,7 +684,12 @@ app.get("/hlsproxy", async (req, res) => {
 
     if (isM3u8) {
       const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
-      const rewritten = response.data.split("\n").map(line => {
+      const lines = response.data.split("\n");
+
+      // Verifica se é um master playlist (tem #EXT-X-STREAM-INF) ou media playlist
+      const isMaster = lines.some(l => l.startsWith("#EXT-X-STREAM-INF"));
+
+      const rewritten = lines.map(line => {
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith("#")) {
           return line.replace(/URI="([^"]+)"/g, (_, uri) => {
@@ -672,10 +699,23 @@ app.get("/hlsproxy", async (req, res) => {
         }
         const abs = trimmed.startsWith("http") ? trimmed : baseUrl + trimmed;
         return makeProxyUrl(abs, referer);
-      }).join("\n");
+      });
+
+      // Para media playlists (não master): injeta VOD e ENDLIST se não tiver
+      // Isso faz o player mostrar a duração total corretamente
+      if (!isMaster) {
+        if (!lines.some(l => l.includes("EXT-X-PLAYLIST-TYPE"))) {
+          const headerIdx = rewritten.findIndex(l => l.startsWith("#EXTM3U"));
+          if (headerIdx >= 0) rewritten.splice(headerIdx + 1, 0, "#EXT-X-PLAYLIST-TYPE:VOD");
+        }
+        if (!lines.some(l => l.trim() === "#EXT-X-ENDLIST")) {
+          rewritten.push("#EXT-X-ENDLIST");
+        }
+      }
+
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.send(rewritten);
+      return res.send(rewritten.join("\n"));
     } else {
       res.setHeader("Content-Type", response.headers["content-type"] || "video/mp2t");
       res.setHeader("Access-Control-Allow-Origin", "*");
