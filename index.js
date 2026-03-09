@@ -3,9 +3,11 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 const crypto = require("crypto");
 
-const PORT = 7001;
+const PORT = process.env.PORT || 7001;
 const BASE = "https://pifansubs.club";
 const TMDB_KEY = "1587e42b775d238f0cd0615731a9c004";
+// URL pública do addon (usada pelo proxy HLS). No Render seta a env var ADDON_URL.
+const ADDON_URL = (process.env.ADDON_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
 
 const manifest = {
   id: "br.pifansubs.stremio",
@@ -131,16 +133,13 @@ async function tmdbSearch(query, type) {
 async function getTitlesFromImdb(imdbId, type) {
   const cacheKey = `imdb:titles:${imdbId}`;
   const cached = getCache(cacheKey);
-  console.log(`[TMDB] getTitles imdbId=${imdbId} cachedType=${typeof cached} cachedVal=${JSON.stringify(cached)} caller=${new Error().stack.split("\n")[2]?.trim()}`);
-  // Não usa cache null — sempre tenta a API
-  if (cached !== undefined && cached !== null) return cached;
+  if (cached !== undefined) return cached;
   try {
     const tmdbType = type === "movie" ? "movie" : "tv";
     const { data } = await axios.get(`https://api.themoviedb.org/3/find/${imdbId}`, {
       params: { api_key: TMDB_KEY, external_source: "imdb_id" },
       timeout: 8000,
     });
-    console.log(`[TMDB] find/${imdbId} keys=${Object.keys(data).join(",")} tv=${data.tv_results?.length} movie=${data.movie_results?.length}`);
     const r = (data[`${tmdbType}_results`] || [])[0];
     if (!r) { setCache(cacheKey, null, 60 * 60 * 1000); return null; }
     const titles = [r.name || r.title, r.original_name || r.original_title].filter(Boolean);
@@ -148,7 +147,7 @@ async function getTitlesFromImdb(imdbId, type) {
     setCache(cacheKey, titles, 7 * 24 * 60 * 60 * 1000);
     return titles;
   } catch (e) {
-    console.warn(`[TMDB] Erro ${imdbId}: ${e.message} | status=${e.response?.status} | data=${JSON.stringify(e.response?.data).slice(0,100)}`);
+    console.warn(`[TMDB] Erro ${imdbId}: ${e.message}`);
     setCache(cacheKey, null, 60 * 60 * 1000);
     return null;
   }
@@ -159,14 +158,13 @@ async function findSlugByTitles(titles, type) {
   for (const title of titles) {
     const cacheKey = `pifan:slug:${type}:${title}`;
     const cached = getCache(cacheKey);
-    if (cached !== undefined && cached !== null) return cached;
+    if (cached !== undefined) return cached;
     try {
-      console.log(`[PIFAN] Buscando: "${title}" type=${type}`);
+      console.log(`[PIFAN] Buscando: "${title}"`);
       const html = await fetchPage(`${BASE}/?s=${encodeURIComponent(title)}`);
       const items = parseArticles(html, type);
-      console.log(`[PIFAN] Resultados: ${items.map(i => i.slug).join(", ") || "nenhum"}`);
       if (items.length > 0) {
-        console.log(`[PIFAN] OK: ${items[0].slug}`);
+        console.log(`[PIFAN] Encontrado: ${items[0].slug}`);
         setCache(cacheKey, items[0].slug, 24 * 60 * 60 * 1000);
         return items[0].slug;
       }
@@ -247,7 +245,42 @@ function decryptAesGcm(key, iv, payload) {
   return Buffer.concat([decipher.update(payload.slice(0, -16)), decipher.final()]);
 }
 
-async function fetchByseStream(hostname, videoId, episodeUrl) {
+// ─── Proxy HLS ───────────────────────────────────────────────────────────────
+// Serve o .m3u8 reescrevendo os segmentos para passar pelo addon
+// Isso evita bloqueios de CORS/Referer quando o Stremio acessa diretamente
+function makeProxyUrl(targetUrl, referer = "") {
+  const enc = encodeURIComponent(targetUrl);
+  const ref = encodeURIComponent(referer);
+  return `${ADDON_URL}/hlsproxy?url=${enc}&ref=${ref}`;
+}
+
+async function rewriteM3u8(m3u8Url, referer) {
+  const { data: m3u8Text } = await axios.get(m3u8Url, {
+    headers: { ...headers, "Referer": referer },
+    timeout: 10000,
+  });
+
+  const baseUrl = m3u8Url.substring(0, m3u8Url.lastIndexOf("/") + 1);
+
+  // Reescreve cada linha que é URI (segmento ou playlist aninhada)
+  const rewritten = m3u8Text.split("\n").map(line => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      // Reescreve URI= dentro de tags como #EXT-X-KEY
+      return line.replace(/URI="([^"]+)"/g, (_, uri) => {
+        const abs = uri.startsWith("http") ? uri : baseUrl + uri;
+        return `URI="${makeProxyUrl(abs, referer)}"`;
+      });
+    }
+    // Linha de segmento ou playlist
+    const abs = trimmed.startsWith("http") ? trimmed : baseUrl + trimmed;
+    return makeProxyUrl(abs, referer);
+  }).join("\n");
+
+  return rewritten;
+}
+
+async function fetchCineBLStream(embedId, episodeUrl) {
   const cineblHeaders = {
     ...headers,
     "X-Embed-Origin": "pifansubs.club",
@@ -256,15 +289,15 @@ async function fetchByseStream(hostname, videoId, episodeUrl) {
     "Referer": `${BASE}/`,
     "Origin": BASE,
   };
-  console.log(`[STREAM] Byse POST: ${hostname} id=${videoId}`);
+  console.log(`[STREAM] CineBL POST: ${embedId}`);
   const { data } = await axios.post(
-    `https://${hostname}/api/videos/${videoId}/embed/playback`,
+    `https://cinebl.com/api/videos/${embedId}/embed/playback`,
     {},
     { headers: cineblHeaders, timeout: 12000 }
   );
   const pb = data?.playback;
   if (!pb?.key_parts || !pb?.iv || !pb?.payload) {
-    console.log(`[STREAM] Byse (${hostname}): sem key_parts. Resposta: ${JSON.stringify(data).slice(0, 200)}`);
+    console.log(`[STREAM] CineBL: sem key_parts`);
     return null;
   }
   const decrypted = JSON.parse(
@@ -273,34 +306,16 @@ async function fetchByseStream(hostname, videoId, episodeUrl) {
   );
   const sources = decrypted?.sources || [];
   if (sources.length === 0) return null;
-  const src = sources.find(s => s.url?.includes(".m3u8")) || sources[0];
-  console.log(`[STREAM] Byse (${hostname}) ✅: ${src.url}`);
-  return { url: src.url, type: src.url?.includes(".m3u8") ? "m3u8" : "mp4" };
-}
-
-// Mantém alias para compatibilidade
-async function fetchCineBLStream(embedId, episodeUrl) {
-  return fetchByseStream("cinebl.com", embedId, episodeUrl);
+  // Prefere MP4 para evitar problemas de proxy; cai no M3U8 se não tiver
+  const mp4Src = sources.find(s => s.url?.includes(".mp4") || s.mimeType?.includes("mp4"));
+  const m3u8Src = sources.find(s => s.url?.includes(".m3u8") || s.mimeType?.includes("mpegurl"));
+  const src = mp4Src || m3u8Src || sources[0];
+  const isHls = src.url?.includes(".m3u8");
+  console.log(`[STREAM] CineBL OK (${isHls ? "m3u8" : "mp4"}): ${src.url}`);
+  return { url: src.url, type: isHls ? "m3u8" : "mp4", referer: BASE };
 }
 
 // ─── Stream ───────────────────────────────────────────────────────────────────
-
-// Detecta o tipo de embed_url para facilitar debug
-function detectPlayerType(embedUrl) {
-  if (!embedUrl) return "none";
-  if (embedUrl.includes("cinebl.com")) return "byse";
-  if (embedUrl.includes("filemoon.in") || embedUrl.includes("filemoon.sx")) return "byse";
-  if (embedUrl.includes("jmvstream.com")) return "jmvstream";
-  if (embedUrl.includes("secvideo1.online") || embedUrl.includes("csst.online") || embedUrl.includes("fsst.online")) return "secvideo";
-  if (embedUrl.includes("youtube.com") || embedUrl.includes("youtu.be")) return "youtube";
-  if (embedUrl.includes("drive.google.com")) return "gdrive";
-  if (embedUrl.includes("rumble.com")) return "rumble";
-  if (embedUrl.includes("ok.ru")) return "okru";
-  if (embedUrl.includes("streamtape")) return "streamtape";
-  if (embedUrl.includes("dood")) return "doodstream";
-  return `desconhecido(${new URL(embedUrl).hostname})`;
-}
-
 async function fetchStream(episodeSlug) {
   const cacheKey = `stream:${episodeSlug}`;
   const cached = getCache(cacheKey);
@@ -316,7 +331,7 @@ async function fetchStream(episodeSlug) {
   const sourceMatch = html.match(/jwplayer\/\?source=([^&"'<\s]+)/);
   if (sourceMatch) {
     const result = { url: decodeURIComponent(sourceMatch[1]), type: "mp4" };
-    console.log(`[STREAM] ✅ Direto MP4: ${result.url.slice(0, 80)}`);
+    console.log(`[STREAM] Direto: ${result.url}`);
     setCache(cacheKey, result, 4 * 60 * 60 * 1000);
     return result;
   }
@@ -324,121 +339,39 @@ async function fetchStream(episodeSlug) {
   // Caso 2: AJAX DooPlay
   const postIdMatch = html.match(/data-post='(\d+)'/);
   const numeMatch = html.match(/data-nume='(\d+)'/);
-
-  if (!postIdMatch || !numeMatch) {
-    // Sem player reconhecível — loga o HTML para diagnóstico
-    const bodySnippet = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 500);
-    console.error(`[STREAM] ❌ Sem player em ${episodeSlug}. Body: ${bodySnippet}`);
-    throw new Error(`Sem player reconhecido: ${episodeSlug}`);
-  }
-
-  const postId = postIdMatch[1];
-  // Pega TODAS as opções de player disponíveis (Opção 1, Opção 2...)
-  const numeOptions = [...html.matchAll(/data-nume='(\d+)'/g)].map(m => m[1]);
-  console.log(`[STREAM] AJAX postId=${postId} opções=${numeOptions.join(",")}`);
-
-  for (const nume of numeOptions) {
-    try {
-      const { data } = await axios.post(
-        `${BASE}/wp-admin/admin-ajax.php`,
-        new URLSearchParams({ action: "doo_player_ajax", post: postId, nume, type: "tv" }).toString(),
-        { headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", "Referer": url }, timeout: 15000 }
-      );
-
-      const embedUrl = data.embed_url;
-      const playerType = detectPlayerType(embedUrl);
-      console.log(`[STREAM] Opção ${nume}: player=${playerType} url=${(embedUrl || "").slice(0, 80)}`);
-
-      if (!embedUrl) continue;
-
-      // Byse Frontend (CineBL, Filemoon — mesma plataforma, mesma API)
-      if (playerType === "byse") {
-        const byseMatch = embedUrl.match(/\/e\/([a-z0-9]+)/i);
-        if (byseMatch) {
-          const hostname = new URL(embedUrl).hostname;
-          const stream = await fetchByseStream(hostname, byseMatch[1], url);
-          if (stream) { setCache(cacheKey, stream, 2 * 60 * 60 * 1000); return stream; }
-          console.warn(`[STREAM] Byse (${hostname}) falhou, tentando próxima opção`);
-          continue;
-        }
+  if (postIdMatch && numeMatch) {
+    const postId = postIdMatch[1];
+    const nume = numeMatch[1];
+    console.log(`[STREAM] AJAX: postId=${postId} nume=${nume}`);
+    const { data } = await axios.post(
+      `${BASE}/wp-admin/admin-ajax.php`,
+      new URLSearchParams({ action: "doo_player_ajax", post: postId, nume, type: "tv" }).toString(),
+      { headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", "Referer": url }, timeout: 15000 }
+    );
+    console.log(`[STREAM] embed_url: ${JSON.stringify(data).slice(0, 120)}`);
+    if (data.embed_url) {
+      const cineblMatch = data.embed_url.match(/cinebl\.com\/e\/([a-z0-9]+)/i);
+      if (cineblMatch) {
+        const stream = await fetchCineBLStream(cineblMatch[1], url);
+        if (stream) { setCache(cacheKey, stream, 2 * 60 * 60 * 1000); return stream; }
+        throw new Error(`CineBL sem sources: ${cineblMatch[1]}`);
       }
-
-      // SecVideo / CSST — MP4 direto no HTML
-      if (playerType === "secvideo") {
-        // Segue redirect e acessa com Referer
-        const { data: svHtml } = await axios.get(embedUrl, {
-          headers: { ...headers, "Referer": BASE },
-          maxRedirects: 5,
-          timeout: 15000,
-        });
-        const svMp4 = svHtml.match(/file:"(https:\/\/[^"]+\.mp4[^"]*)"/);
-        if (svMp4) {
-          const result = { url: svMp4[1], type: "mp4" };
-          console.log(`[STREAM] ✅ SecVideo MP4: ${result.url.slice(0, 80)}`);
-          setCache(cacheKey, result, 4 * 60 * 60 * 1000);
-          return result;
-        }
-        console.warn(`[STREAM] SecVideo sem MP4 em ${embedUrl}`);
-        continue;
-      }
-
-      // YouTube — não suportado
-      if (playerType === "youtube") {
-        console.warn(`[STREAM] YouTube não suportado, pulando opção ${nume}`);
-        continue;
-      }
-
-      // Google Drive — não suportado
-      if (playerType === "gdrive") {
-        console.warn(`[STREAM] Google Drive não suportado, pulando opção ${nume}`);
-        continue;
-      }
-
-      // JMVStream / outros: acessa HTML do player e extrai src
-      const { data: playerHtml } = await axios.get(embedUrl, {
+      const { data: playerHtml } = await axios.get(data.embed_url, {
         headers: { ...headers, "Referer": BASE }, timeout: 15000,
       });
-
       const m3u8Match = playerHtml.match(/"src":"(https:\/\/[^"]+playlist\.m3u8[^"]+)"/);
       if (m3u8Match) {
         const result = { url: m3u8Match[1].replace(/\\/g, ""), type: "m3u8" };
-        console.log(`[STREAM] ✅ M3U8 opção ${nume}: ${result.url.slice(0, 80)}`);
-        setCache(cacheKey, result, 4 * 60 * 60 * 1000);
-        return result;
+        setCache(cacheKey, result, 4 * 60 * 60 * 1000); return result;
       }
-
       const mp4Match = playerHtml.match(/"src":"(https:\/\/[^"]+\.mp4[^"]*)"/);
       if (mp4Match) {
         const result = { url: mp4Match[1].replace(/\\/g, ""), type: "mp4" };
-        console.log(`[STREAM] ✅ MP4 opção ${nume}: ${result.url.slice(0, 80)}`);
-        setCache(cacheKey, result, 4 * 60 * 60 * 1000);
-        return result;
+        setCache(cacheKey, result, 4 * 60 * 60 * 1000); return result;
       }
-
-      // Loga o que veio para debug
-      const snippet = playerHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 300);
-      console.warn(`[STREAM] ⚠️ Player ${playerType} sem src reconhecido. Trecho: ${snippet}`);
-
-    } catch (e) {
-      console.error(`[STREAM] Erro na opção ${nume}: ${e.message}`);
     }
   }
-
-  throw new Error(`Nenhuma opção de stream funcionou: ${episodeSlug}`);
-}
-
-// Gera variações de título para aumentar chance de match no PiFansubs
-function titleVariants(titles) {
-  const variants = new Set();
-  for (const t of titles) {
-    if (!t) continue;
-    variants.add(t);
-    // Remove subtítulo após ":" ou "-" (ex: "Color Rush: The Tint" → "Color Rush")
-    variants.add(t.split(/\s*[:\u2013\u2014]\s*/)[0].trim());
-    // Remove artigos e palavras curtas no início
-    variants.add(t.replace(/^(the|a|an)\s+/i, "").trim());
-  }
-  return [...variants].filter(v => v.length > 1);
+  throw new Error(`Stream nao encontrado: ${episodeSlug}`);
 }
 
 // Resolve o slug do episódio a partir de qualquer formato de ID
@@ -457,19 +390,17 @@ async function resolveEpisodeSlug(id, type) {
     const season = parseInt(ttMatch[2]);
     const episode = parseInt(ttMatch[3]);
 
-    // 1. Busca títulos via TMDB (PT-BR + original)
+    // 1. Busca títulos pelo IMDB ID
     const titles = await getTitlesFromImdb(imdbId, type);
     if (!titles) {
       console.log(`[RESOLVE] TMDB nao encontrou ${imdbId}`);
       return null;
     }
 
-    // 2. Busca slug no PiFansubs tentando variações dos títulos
-    const variants = titleVariants(titles);
-    console.log(`[RESOLVE] Tentando variações: ${variants.join(" | ")}`);
-    const slug = await findSlugByTitles(variants, type);
+    // 2. Busca slug no PiFansubs
+    const slug = await findSlugByTitles(titles, type);
     if (!slug) {
-      console.log(`[RESOLVE] PiFansubs nao tem nenhuma variação de: ${titles.join(" / ")}`);
+      console.log(`[RESOLVE] PiFansubs nao tem: ${titles.join(" / ")}`);
       return null;
     }
 
@@ -477,30 +408,19 @@ async function resolveEpisodeSlug(id, type) {
     const detail = await fetchDetail(slug, type);
     if (!detail.episodes.length) return null;
 
-    // 4. Encontra episódio pelo padrão SxE no slug (ex: "color-rush-1x2")
-    // Os slugs do PiFansubs seguem o padrão "nome-da-serie-SxE"
-    const epBySlug = detail.episodes.find(ep => {
-      const m = ep.slug.match(/(\d+)x(\d+)$/);
-      return m && parseInt(m[1]) === season && parseInt(m[2]) === episode;
-    });
-
-    if (epBySlug) {
-      console.log(`[RESOLVE] ✅ ${imdbId} S${season}E${episode} -> ${epBySlug.slug}`);
-      return epBySlug.slug;
-    }
-
-    // Fallback: usa índice linear (episódios em ordem, 1 temporada)
+    // Episódios do PiFansubs vêm em ordem reversa (mais recente primeiro)
+    // Inverte para que índice 0 = episódio 1
     const ordered = [...detail.episodes].reverse();
-    const linearIndex = (season - 1) * 100 + (episode - 1); // assume max 100 eps/temporada
-    const epByIndex = ordered[linearIndex] || ordered[episode - 1];
+    const ep = ordered[(season - 1) * ordered.length + (episode - 1)]
+            || ordered[episode - 1];
 
-    if (epByIndex) {
-      console.log(`[RESOLVE] ✅ (fallback índice) ${imdbId} S${season}E${episode} -> ${epByIndex.slug}`);
-      return epByIndex.slug;
+    if (!ep) {
+      console.log(`[RESOLVE] S${season}E${episode} nao achado em ${slug} (${detail.episodes.length} eps)`);
+      return null;
     }
 
-    console.log(`[RESOLVE] S${season}E${episode} não encontrado em ${slug} (${detail.episodes.length} eps)`);
-    return null;
+    console.log(`[RESOLVE] ${imdbId} S${season}E${episode} -> ${ep.slug}`);
+    return ep.slug;
   }
 
   return null;
@@ -564,12 +484,29 @@ builder.defineStreamHandler(async ({ type, id }) => {
       return { streams: [] };
     }
     const stream = await fetchStream(episodeSlug);
+
+    // Para M3U8: serve via proxy HLS do addon para evitar bloqueios de Referer
+    let streamUrl = stream.url;
+    let notWebReady = false;
+    if (stream.type === "m3u8") {
+      try {
+        // Proxy reescreve o m3u8 — Stremio acessa segmentos pelo addon
+        streamUrl = makeProxyUrl(stream.url, stream.referer || BASE);
+        console.log(`[STREAM] HLS via proxy: ${streamUrl.slice(0, 80)}`);
+        notWebReady = false; // proxy serve HTTP normal, Stremio consegue
+      } catch (e) {
+        console.warn(`[STREAM] Proxy falhou, entregando m3u8 direto: ${e.message}`);
+        streamUrl = stream.url;
+        notWebReady = true;
+      }
+    }
+
     return {
       streams: [{
-        url: stream.url,
+        url: streamUrl,
         name: "PiFansubs",
         title: `PT-BR | PiFansubs\n${stream.type.toUpperCase()}`,
-        behaviorHints: { notWebReady: stream.type === "m3u8" },
+        behaviorHints: { notWebReady },
       }],
     };
   } catch (e) {
@@ -578,6 +515,71 @@ builder.defineStreamHandler(async ({ type, id }) => {
   }
 });
 
-serveHTTP(builder.getInterface(), { port: PORT });
-console.log(`\n✅ PiFansubs addon rodando em http://localhost:${PORT}`);
-console.log(`📺 Instale no Stremio: http://localhost:${PORT}/manifest.json\n`);
+// ─── Servidor Express com rota de proxy HLS ───────────────────────────────────
+const express = require("express");
+const app = express();
+
+// Proxy HLS: baixa .m3u8 ou segmento e repassa com headers corretos
+app.get("/hlsproxy", async (req, res) => {
+  const targetUrl = decodeURIComponent(req.query.url || "");
+  const referer   = decodeURIComponent(req.query.ref || BASE);
+
+  if (!targetUrl.startsWith("http")) {
+    return res.status(400).send("URL inválida");
+  }
+
+  try {
+    const isM3u8 = targetUrl.includes(".m3u8") || targetUrl.includes("playlist");
+    const response = await axios.get(targetUrl, {
+      headers: {
+        ...headers,
+        "Referer": referer,
+        "Origin": new URL(referer).origin,
+      },
+      responseType: isM3u8 ? "text" : "stream",
+      timeout: 15000,
+    });
+
+    if (isM3u8) {
+      // Reescreve URLs dentro do m3u8 para também passar pelo proxy
+      const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
+      const rewritten = response.data.split("\n").map(line => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) {
+          return line.replace(/URI="([^"]+)"/g, (_, uri) => {
+            const abs = uri.startsWith("http") ? uri : baseUrl + uri;
+            return `URI="${makeProxyUrl(abs, referer)}"`;
+          });
+        }
+        const abs = trimmed.startsWith("http") ? trimmed : baseUrl + trimmed;
+        return makeProxyUrl(abs, referer);
+      }).join("\n");
+
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.send(rewritten);
+    } else {
+      // Segmento: repassa o stream binário
+      res.setHeader("Content-Type", response.headers["content-type"] || "video/mp2t");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      response.data.pipe(res);
+    }
+  } catch (e) {
+    console.error(`[PROXY] Erro: ${e.message} url=${targetUrl.slice(0, 80)}`);
+    res.status(502).send("Proxy error");
+  }
+});
+
+// Monta o addon Stremio no mesmo servidor Express
+const addonInterface = builder.getInterface();
+app.use("/", (req, res, next) => {
+  // Deixa o proxy responder /hlsproxy; resto vai pro SDK
+  if (req.path.startsWith("/hlsproxy")) return next();
+  addonInterface(req, res, next);
+});
+
+app.listen(PORT, () => {
+  console.log(`\n✅ PiFansubs addon rodando em http://localhost:${PORT}`);
+  console.log(`📺 Instale no Stremio: http://localhost:${PORT}/manifest.json`);
+  console.log(`🔗 ADDON_URL=${ADDON_URL}\n`);
+});
