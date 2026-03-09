@@ -355,13 +355,62 @@ async function fetchStream(episodeSlug) {
     );
     console.log(`[STREAM] embed_url: ${JSON.stringify(data).slice(0, 120)}`);
     if (data.embed_url) {
-      const cineblMatch = data.embed_url.match(/cinebl\.com\/e\/([a-z0-9]+)/i);
-      if (cineblMatch) {
-        const stream = await fetchCineBLStream(cineblMatch[1], url);
-        if (stream) { setCache(cacheKey, stream, 2 * 60 * 60 * 1000); return stream; }
-        throw new Error(`CineBL sem sources: ${cineblMatch[1]}`);
+      const embedUrl = data.embed_url;
+
+      // Byse Frontend: CineBL, Filemoon, Cinewaha e qualquer clone — detecta pelo padrão /e/ID
+      const byseMatch = embedUrl.match(/^https?:\/\/([^/]+)\/e\/([a-z0-9]+)/i);
+      if (byseMatch) {
+        const hostname = byseMatch[1];
+        const videoId = byseMatch[2];
+        console.log(`[STREAM] Byse: ${hostname} id=${videoId}`);
+        const byseHeaders = {
+          ...headers,
+          "X-Embed-Origin": "pifansubs.club",
+          "X-Embed-Referer": url,
+          "Content-Type": "application/json",
+          "Referer": `${BASE}/`,
+          "Origin": BASE,
+        };
+        const { data: pbData } = await axios.post(
+          `https://${hostname}/api/videos/${videoId}/embed/playback`,
+          {},
+          { headers: byseHeaders, timeout: 12000 }
+        );
+        const pb = pbData?.playback;
+        if (pb?.key_parts && pb?.iv && pb?.payload) {
+          const decrypted = JSON.parse(
+            decryptAesGcm(joinKeyParts(pb.key_parts), b64urlToBuffer(pb.iv), b64urlToBuffer(pb.payload))
+            .toString("utf8")
+          );
+          const sources = decrypted?.sources || [];
+          if (sources.length > 0) {
+            const mp4Src = sources.find(s => s.url?.includes(".mp4") || s.mimeType?.includes("mp4"));
+            const m3u8Src = sources.find(s => s.url?.includes(".m3u8") || s.mimeType?.includes("mpegurl"));
+            const src = mp4Src || m3u8Src || sources[0];
+            const isHls = !mp4Src && src.url?.includes(".m3u8");
+            console.log(`[STREAM] Byse OK (${isHls ? "m3u8" : "mp4"}): ${src.url}`);
+            const result = { url: src.url, type: isHls ? "m3u8" : "mp4", referer: BASE };
+            setCache(cacheKey, result, 2 * 60 * 60 * 1000);
+            return result;
+          }
+        }
+        console.warn(`[STREAM] Byse sem sources para ${hostname}/${videoId}`);
       }
-      const { data: playerHtml } = await axios.get(data.embed_url, {
+
+      // SecVideo / CSST — MP4 direto no HTML
+      if (embedUrl.includes("secvideo") || embedUrl.includes("csst.online") || embedUrl.includes("fsst.online")) {
+        const { data: svHtml } = await axios.get(embedUrl, {
+          headers: { ...headers, "Referer": BASE }, maxRedirects: 5, timeout: 15000,
+        });
+        const svMp4 = svHtml.match(/file:"(https:\/\/[^"]+\.mp4[^"]*)"/);
+        if (svMp4) {
+          const result = { url: svMp4[1], type: "mp4" };
+          setCache(cacheKey, result, 4 * 60 * 60 * 1000); return result;
+        }
+      }
+
+      // JMVStream e outros — extrai src do HTML do player
+      const { data: playerHtml } = await axios.get(embedUrl, {
         headers: { ...headers, "Referer": BASE }, timeout: 15000,
       });
       const m3u8Match = playerHtml.match(/"src":"(https:\/\/[^"]+playlist\.m3u8[^"]+)"/);
@@ -374,6 +423,9 @@ async function fetchStream(episodeSlug) {
         const result = { url: mp4Match[1].replace(/\\/g, ""), type: "mp4" };
         setCache(cacheKey, result, 4 * 60 * 60 * 1000); return result;
       }
+
+      const hn = (() => { try { return new URL(embedUrl).hostname; } catch(e) { return embedUrl; } })();
+      console.warn(`[STREAM] Player desconhecido (${hn}). Trecho: ${playerHtml.slice(0, 200)}`);
     }
   }
   throw new Error(`Stream nao encontrado: ${episodeSlug}`);
@@ -436,19 +488,61 @@ async function resolveEpisodeSlug(id, type) {
     const detail = await fetchDetail(slug, type);
     if (!detail.episodes.length) return null;
 
-    // Episódios do PiFansubs vêm em ordem reversa (mais recente primeiro)
-    // Inverte para que índice 0 = episódio 1
+    // Episódios do PiFansubs vêm em ordem reversa — inverte para índice 0 = ep 1
     const ordered = [...detail.episodes].reverse();
-    const ep = ordered[(season - 1) * ordered.length + (episode - 1)]
-            || ordered[episode - 1];
 
-    if (!ep) {
-      console.log(`[RESOLVE] S${season}E${episode} nao achado em ${slug} (${detail.episodes.length} eps)`);
-      return null;
+    // Tentativa 1: match exato pelo padrão SxE no slug (ex: "his-man-3x2")
+    const epExact = ordered.find(ep => {
+      const m = ep.slug.match(/(\d+)x(\d+)$/);
+      return m && parseInt(m[1]) === season && parseInt(m[2]) === episode;
+    });
+    if (epExact) {
+      console.log(`[RESOLVE] ✅ exato S${season}E${episode} -> ${epExact.slug}`);
+      return epExact.slug;
     }
 
-    console.log(`[RESOLVE] ${imdbId} S${season}E${episode} -> ${ep.slug}`);
-    return ep.slug;
+    // Tentativa 2: descobre quantos eps tem cada temporada pelos slugs
+    // Agrupa episódios por temporada
+    const bySeason = {};
+    for (const ep of ordered) {
+      const m = ep.slug.match(/(\d+)x(\d+)$/);
+      if (m) {
+        const s = parseInt(m[1]);
+        if (!bySeason[s]) bySeason[s] = [];
+        bySeason[s].push(ep);
+      }
+    }
+    if (Object.keys(bySeason).length > 0) {
+      const seasonEps = bySeason[season];
+      if (seasonEps) {
+        const epFound = seasonEps.find(ep => {
+          const m = ep.slug.match(/(\d+)x(\d+)$/);
+          return m && parseInt(m[2]) === episode;
+        }) || seasonEps[episode - 1];
+        if (epFound) {
+          console.log(`[RESOLVE] ✅ byseason S${season}E${episode} -> ${epFound.slug}`);
+          return epFound.slug;
+        }
+      }
+      // Fallback: índice absoluto somando eps das temporadas anteriores
+      let offset = 0;
+      for (let s = 1; s < season; s++) offset += (bySeason[s]?.length || 0);
+      const epByOffset = ordered[offset + episode - 1];
+      if (epByOffset) {
+        console.log(`[RESOLVE] ✅ offset S${season}E${episode} -> ${epByOffset.slug}`);
+        return epByOffset.slug;
+      }
+    }
+
+    // Último fallback: índice linear simples
+    const epLinear = ordered[episode - 1];
+    if (epLinear) {
+      console.log(`[RESOLVE] ✅ linear S${season}E${episode} -> ${epLinear.slug}`);
+      return epLinear.slug;
+    }
+
+    console.log(`[RESOLVE] S${season}E${episode} nao achado em ${slug} (${detail.episodes.length} eps)`);
+    return null;
   }
 
   return null;
