@@ -571,12 +571,10 @@ app.get("/hlsproxy", async (req, res) => {
 });
 
 // Monta o addon Stremio no mesmo servidor Express
-const addonInterface = builder.getInterface();
-app.use("/", (req, res, next) => {
-  // Deixa o proxy responder /hlsproxy; resto vai pro SDK
-  if (req.path.startsWith("/hlsproxy")) return next();
-  addonInterface(req, res, next);
-});
+// getInterface() retorna { manifest, query } — usamos o router do SDK
+const { getRouter } = require("stremio-addon-sdk");
+const addonRouter = getRouter(builder.getInterface());
+app.use("/", addonRouter);
 
 app.listen(PORT, () => {
   console.log(`\n✅ PiFansubs addon rodando em http://localhost:${PORT}`);
