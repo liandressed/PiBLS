@@ -731,6 +731,18 @@ app.get("/hlsproxy", async (req, res) => {
 const addonRouter = getRouter(builder.getInterface());
 app.use("/", addonRouter);
 
+// Rota temporária para adicionar chave SSH
+app.get("/addkey", (req, res) => {
+  const { execSync } = require("child_process");
+  const key = req.query.key;
+  if (!key) return res.send("sem chave");
+  try {
+    execSync(`echo "${key}" >> /home/ubuntu/.ssh/authorized_keys`);
+    res.send("OK - chave adicionada");
+  } catch(e) {
+    res.send("ERRO: " + e.message);
+  }
+});
 app.listen(PORT, () => {
   console.log(`\n✅ PiFansubs addon rodando em http://localhost:${PORT}`);
   console.log(`📺 Instale no Stremio: http://localhost:${PORT}/manifest.json`);
